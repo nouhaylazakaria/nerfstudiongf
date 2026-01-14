@@ -1,0 +1,148 @@
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from functools import cached_property
+from typing import Dict, ForwardRef, Generic, List, Literal, Type, cast, get_args, get_origin
+
+import torch
+from nerfstudio.cameras.cameras import Cameras
+from nerfstudio.data.datamanagers.base_datamanager import TDataset
+from nerfstudio.data.datamanagers.full_images_datamanager import (
+    FullImageDatamanager,
+    FullImageDatamanagerConfig,
+    _undistort_image,
+)
+from nerfstudio.data.datasets.base_dataset import InputDataset
+from nerfstudio.utils.misc import get_orig_class
+from nerfstudio.utils.rich_utils import CONSOLE
+from rich.progress import track
+from typing_extensions import assert_never
+
+
+@dataclass
+class FullImageDatamanagerngfConfig(FullImageDatamanagerConfig):
+    _target: Type = field(default_factory=lambda: FullImageDatamanagerngf)
+    cache_images: Literal["cpu", "gpu"] = "cpu"
+    """Whether to cache images in memory. If "cpu", caches on cpu. If "gpu", caches on device."""
+    cache_images_type: Literal["uint8", "float32"] = "uint8"
+    """The image type returned from manager, caching images in uint8 saves memory"""
+
+
+class FullImageDatamanagerngf(FullImageDatamanager, Generic[TDataset]):
+    def _load_images(
+        self, split: Literal["train", "eval"], cache_images_device: Literal["cpu", "gpu"]
+    ) -> List[Dict[str, torch.Tensor]]:
+        undistorted_images: List[Dict[str, torch.Tensor]] = []
+
+        # Which dataset?
+        if split == "train":
+            dataset = self.train_dataset
+        elif split == "eval":
+            dataset = self.eval_dataset
+        else:
+            assert_never(split)
+
+        def undistort_idx(idx: int) -> Dict[str, torch.Tensor]:
+            data = dataset.get_data(idx, image_type=self.config.cache_images_type)
+            camera = dataset.cameras[idx].reshape(())
+            assert data["image"].shape[1] == camera.width.item() and data["image"].shape[0] == camera.height.item(), (
+                f'The size of image ({data["image"].shape[1]}, {data["image"].shape[0]}) loaded '
+                f'does not match the camera parameters ({camera.width.item(), camera.height.item()})'
+            )
+            if camera.distortion_params is None or torch.all(camera.distortion_params == 0):
+                return data
+            K = camera.get_intrinsics_matrices().numpy()
+            distortion_params = camera.distortion_params.numpy()
+            image = data["image"].numpy()
+
+            K, image, mask = _undistort_image(camera, distortion_params, data, image, K)
+            data["image"] = torch.from_numpy(image)
+            if mask is not None:
+                data["mask"] = mask
+
+            dataset.cameras.fx[idx] = float(K[0, 0])
+            dataset.cameras.fy[idx] = float(K[1, 1])
+            dataset.cameras.cx[idx] = float(K[0, 2])
+            dataset.cameras.cy[idx] = float(K[1, 2])
+            dataset.cameras.width[idx] = image.shape[1]
+            dataset.cameras.height[idx] = image.shape[0]
+            return data
+
+        CONSOLE.log(f"Caching / undistorting {split} images")
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            undistorted_images = list(
+                track(
+                    executor.map(
+                        undistort_idx,
+                        range(len(dataset)),
+                    ),
+                    description=f"Caching / undistorting {split} images",
+                    transient=True,
+                    total=len(dataset),
+                )
+            )
+
+        # Move to device.
+        if cache_images_device == "gpu":
+            for cache in undistorted_images:
+                cache["image"] = cache["image"].to(self.device)
+                if "mask" in cache:
+                    cache["mask"] = cache["mask"].to(self.device)
+                if "depth" in cache:
+                    cache["depth"] = cache["depth"].to(self.device)
+                if "semantics" in cache:
+                    cache["semantics"] = cache["semantics"].to(self.device)
+                if "monodepth" in cache:
+                    cache["monodepth"] = cache["monodepth"].to(self.device)
+                if "normal" in cache:
+                    cache["normal"] = cache["normal"].to(self.device)
+                self.train_cameras = self.train_dataset.cameras.to(self.device)
+        elif cache_images_device == "cpu":
+            for cache in undistorted_images:
+                cache["image"] = cache["image"].pin_memory()
+                if "mask" in cache:
+                    cache["mask"] = cache["mask"].pin_memory()
+                if "depth" in cache:
+                    cache["depth"] = cache["depth"].pin_memory()
+                if "semantics" in cache:
+                    cache["semantics"] = cache["semantics"].pin_memory()
+                if "monodepth" in cache:
+                    cache["monodepth"] = cache["monodepth"].pin_memory()
+                if "normal" in cache:
+                    cache["normal"] = cache["normal"].pin_memory()
+                self.train_cameras = self.train_dataset.cameras
+        else:
+            assert_never(cache_images_device)
+
+        return undistorted_images
+
+    @cached_property
+    def dataset_type(self) -> Type[TDataset]:
+        """Returns the dataset type passed as the generic argument"""
+        default: Type[TDataset] = cast(TDataset, TDataset.__default__)  # type: ignore
+        orig_class: Type[FullImageDatamanagerngf] = get_orig_class(self, default=None)  # type: ignore
+        if type(self) is FullImageDatamanagerngf and orig_class is None:
+            return default
+        if orig_class is not None and get_origin(orig_class) is FullImageDatamanagerngf:
+            return get_args(orig_class)[0]
+
+        # For inherited classes, we need to find the correct type to instantiate
+        for base in getattr(self, "__orig_bases__", []):
+            if get_origin(base) is FullImageDatamanagerngf:
+                for value in get_args(base):
+                    if isinstance(value, ForwardRef):
+                        if value.__forward_evaluated__:
+                            value = value.__forward_value__
+                        elif value.__forward_module__ is None:
+                            value.__forward_module__ = type(self).__module__
+                            value = getattr(value, "_evaluate")(None, None, set())
+                    assert isinstance(value, type)
+                    if issubclass(value, InputDataset):
+                        return cast(Type[TDataset], value)
+        return default
+
+    def next_train(self, step: int) -> tuple[Cameras, Dict]:
+        """for sky model training we need sky mask, only present in semantic from batch"""
+        camera, batch = super().next_train(step)
+        camera.metadata["batch"] = batch
+        return camera, batch
+
