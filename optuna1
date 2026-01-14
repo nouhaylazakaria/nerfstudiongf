@@ -1,0 +1,148 @@
+from dataclasses import dataclass, field
+from typing import Type, List, Union, TypedDict, Optional
+
+
+
+import subprocess
+import yaml
+import re
+
+
+
+from dataclasses import dataclass, field
+from typing import Type, Optional
+
+
+
+
+from nerfstudio.models.splatfactongf import  SplatfactongfModelConfig
+from nerfstudio.utils.rich_utils import CONSOLE
+from sklearn.neighbors import NearestNeighbors
+import time
+import os
+from nerfstudio.splatfactongf.embedding import Embedding
+from einops import repeat
+from functools import reduce
+
+from nerfstudio.cameras.cameras import Cameras
+from typing import Dict, List, Literal, Optional, Tuple, Type, Union
+#from ..splatfactongf.annotations import Annotations
+#from ..data.datamanagers.ngfdatamanager import NGFDataManager
+
+import math
+from nerfstudio.model_components.mlps import ColorMLP, CovarianceMLP, FeatureBankMLP, OpacityMLP ,Raydrop_probability
+from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes, TrainingCallbackLocation
+from nerfstudio.model_components.lib_bilagrid import BilateralGrid, color_correct, slice, total_variation_loss
+
+import optuna
+
+import torch
+
+from nerfstudio.pipelines.ngfpipeline import Pipelinengf,PipelinengfConfig
+from nerfstudio.data.datamanagers.full_images_datamanager_ngf import FullImageDatamanagerngf,FullImageDatamanagerngfConfig  # Adjust the import to your actual module name
+from nerfstudio.data.datasets.ngfdataset import ngfDataset
+from nerfstudio.configs.method_configs import method_configs
+
+
+import re
+
+def extract_loss(output):
+    """Extrait la dernière valeur de la loss des logs d'entraînement."""
+    #loss_values = re.findall(r"[Ll]oss:\s*([\d.e+-]+)", output)
+    loss_values = re.findall(r"Total Loss:\s*tensor\(([-+]?\d*\.\d+|\d+)(?:,[^)]*)?\)", output, re.IGNORECASE)
+    if loss_values:
+        return float(loss_values[-1])  # Prendre la dernière valeur trouvée
+    return float("inf") 
+
+# Assuming result is the output from the subprocess.run
+
+
+
+
+def objective(trial):
+    # Define hyperparameters to tune
+    
+
+    # Fine-tuning additional specific hyperparameters
+    n_offsets = trial.suggest_int("n_offsets", 1, 10)  # Number of offsets for Gaussian representations
+    feature_lr = trial.suggest_loguniform("feature_lr", 1e-6, 1e-2)
+    opacity_lr = trial.suggest_loguniform("opacity_lr", 1e-6, 1e-2)
+    scaling_lr = trial.suggest_loguniform("scaling_lr", 1e-6, 1e-2)
+    rotation_lr = trial.suggest_loguniform("rotation_lr", 1e-6, 1e-2)
+    mlp_opacity_lr_init = trial.suggest_loguniform("mlp_opacity_lr_init", 1e-6, 1e-2)
+    mlp_cov_lr_init = trial.suggest_loguniform("mlp_cov_lr_init", 1e-6, 1e-2)
+    mlp_color_lr_init = trial.suggest_loguniform("mlp_color_lr_init", 1e-6, 1e-2)
+    appearance_lr_init = trial.suggest_loguniform("appearance_lr_init", 1e-6, 1e-2)
+    position_lr_init = trial.suggest_loguniform("position_lr_init", 1e-6, 1e-2)
+    offset_lr_init = trial.suggest_loguniform("offset_lr_init", 1e-6, 1e-2)
+    spatial_lr_scale = trial.suggest_loguniform("spatial_lr_scale", 1e-6, 1e-2)
+
+    voxel_size = trial.suggest_loguniform("voxel_size", 1e-6, 1e-2)
+    
+
+    update_depth = trial.suggest_int("update_depth", 1, 10)
+    
+
+    # Set up the device
+    #device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Define your configuration for the pipeline
+    with open("outputs/sequence_175872_refined/splatfactongf/2025-03-27_191243/config.yml", "r") as f:
+        config = yaml.load(f, Loader=yaml.UnsafeLoader)
+
+    
+    config.n_offsets = n_offsets
+  
+    config.spatial_lr_scale = spatial_lr_scale 
+    config.feature_lr = feature_lr
+    config.opacity_lr = opacity_lr
+    config.scaling_lr = scaling_lr
+    config.rotation_lr = rotation_lr
+    config.mlp_opacity_lr_init = mlp_opacity_lr_init
+    config.mlp_cov_lr_init = mlp_cov_lr_init
+    config.mlp_color_lr_init = mlp_color_lr_init
+    config.appearance_lr_init = appearance_lr_init
+    config.position_lr_init = position_lr_init
+    config.offset_lr_init = offset_lr_init
+    
+    config.voxel_size = voxel_size
+    
+    
+    
+    config.update_depth = update_depth
+    
+    
+    
+    
+    
+    
+
+
+    # Sauvegarder la nouvelle config temporaire
+    temp_config_path = "nerfstudio/configs/temp_image.yaml"
+    with open(temp_config_path, "w") as f:
+        yaml.dump(config, f)
+    command = ["ns-train", "splatfactongf", "--load-config", temp_config_path, "--data=/data/dev/wod_export/experiment_lidar/sequence_175872_refined"]
+    result = subprocess.run(command, capture_output=True, text=True)
+    
+    if result.returncode != 0:
+        print(f" Erreur dans l'exécution de main.py :\n{result.stderr}")
+        return float("inf") 
+    Total_loss = extract_loss(result.stdout)
+    print(f"Total_loss: {Total_loss}")
+    if Total_loss is None or Total_loss == float("inf") or Total_loss != Total_loss:  # Vérifie NaN
+        print(f" Warning: loss non valide détectée ({Total_loss}), retour à inf.")
+        return float("inf")
+    return Total_loss
+    
+
+# Set up and run the study
+def optimize():
+    study = optuna.create_study(direction="minimize")  # We want to minimize the objective
+    study.optimize(objective, n_trials=15)  # Perform 100 trials
+
+    # Print the best hyperparameters
+    print("Best hyperparameters: ", study.best_params)
+
+if __name__ == "__main__":
+    optimize()
