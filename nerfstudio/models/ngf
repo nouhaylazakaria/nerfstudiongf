@@ -1,0 +1,1464 @@
+from dataclasses import dataclass, field
+from typing import Type, List, Union, TypedDict, Optional
+
+import torch
+
+try:
+    from gsplat.rendering import rasterization
+except ImportError:
+    print("Please install gsplat>=1.0.0")
+
+from nerfstudio.engine.optimizers import Optimizers
+from nerfstudio.models.splatfacto import SplatfactoModel, SplatfactoModelConfig, get_viewmat
+from nerfstudio.cameras.cameras import Cameras
+from pytorch3d import transforms
+from nerfstudio.utils.rich_utils import CONSOLE
+import torch.nn.functional as F
+import numpy as np
+
+from dataclasses import dataclass, field
+from typing import Type, Optional
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn import Parameter 
+from nerfstudio.models.splatfacto import SplatfactoModel, SplatfactoModelConfig
+from nerfstudio.utils.rich_utils import CONSOLE
+from sklearn.neighbors import NearestNeighbors
+import time
+import os
+from nerfstudio.splatfactongf.embedding import Embedding
+from einops import repeat
+from functools import reduce
+from torch_scatter import scatter_max
+from nerfstudio.cameras.cameras import Cameras
+from typing import Dict, List, Literal, Optional, Tuple, Type, Union
+#from ..splatfactongf.annotations import Annotations
+#from ..data.datamanagers.ngfdatamanager import NGFDataManager
+import torch
+from gsplat.cuda_legacy._wrapper import num_sh_bases
+import math
+from nerfstudio.model_components.mlps import ColorMLP, CovarianceMLP, FeatureBankMLP, OpacityMLP ,Raydrop_probability
+from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes, TrainingCallbackLocation
+from nerfstudio.model_components.lib_bilagrid import BilateralGrid, color_correct, slice, total_variation_loss
+#from nerfstudio.splatfactongf.mathngf import chamfer_distance, rmse_metric
+#from nerfstudio.splatfactongf.annotationsngf import Annotations
+
+def quat_to_rotmat(quat):
+    assert quat.shape[-1] == 4, quat.shape
+    w, x, y, z = torch.unbind(quat, dim=-1)
+    mat = torch.stack(
+        [
+            1 - 2 * (y**2 + z**2),
+            2 * (x * y - w * z),
+            2 * (x * z + w * y),
+            2 * (x * y + w * z),
+            1 - 2 * (x**2 + z**2),
+            2 * (y * z - w * x),
+            2 * (x * z - w * y),
+            2 * (y * z + w * x),
+            1 - 2 * (x**2 + y**2),
+        ],
+        dim=-1,
+    )
+    return mat.reshape(quat.shape[:-1] + (3, 3))
+
+def knn(x, K):
+    x_np = x
+    model = NearestNeighbors(n_neighbors=K, metric="euclidean").fit(x_np)
+    distances, _ = model.kneighbors(x_np)
+    return torch.from_numpy(distances)
+
+def inverse_sigmoid(x):
+    return torch.log(x/(1-x))
+def RGB2SH(rgb):
+    """
+    Converts from RGB values [0,1] to the 0th spherical harmonic coefficient
+    """
+    C0 = 0.28209479177387814
+    return (rgb - 0.5) / C0
+def random_quat_tensor(N):
+    """
+    Defines a random quaternion tensor of shape (N, 4)
+    """
+    u = torch.rand(N)
+    v = torch.rand(N)
+    w = torch.rand(N)
+    return torch.stack(
+        [
+            torch.sqrt(1 - u) * torch.sin(2 * math.pi * v),
+            torch.sqrt(1 - u) * torch.cos(2 * math.pi * v),
+            torch.sqrt(u) * torch.sin(2 * math.pi * w),
+            torch.sqrt(u) * torch.cos(2 * math.pi * w),
+        ],
+        dim=-1,
+    )
+def SH2RGB(sh):
+    """
+    Converts from the 0th spherical harmonic coefficient to RGB values [0,1]
+    """
+    C0 = 0.28209479177387814
+    return sh * C0 + 0.5
+
+
+
+def calculate_median_pairwise_distance(points):
+    """Calculate the median of pairwise distances between points."""
+    
+    num_points = points.shape[0]
+    
+    # Use a method that prevents heavy memory allocation
+    pairwise_distances = []
+    for i in range(num_points):
+        # Compute distance from the i-th point to all other points
+        distances = torch.norm(points - points[i], p=2, dim=1)  # Shape: (N,)
+        pairwise_distances.append(distances)
+
+    # Convert list of tensors into one tensor and flatten
+    pairwise_distances = torch.stack(pairwise_distances)
+    
+    # Extract the upper triangle distances
+    upper_tri_mask = torch.triu(torch.ones(num_points, num_points), diagonal=1).bool()
+    pairwise_distances = pairwise_distances[upper_tri_mask]  # Flatten to (num_pairs,)
+
+    # Calculate the median
+    median_distance = torch.median(pairwise_distances)
+
+    return median_distance.item() 
+
+@dataclass
+class SplatfactongfModelConfig(SplatfactoModelConfig):
+    """Configuration class for SplatfactongfModel"""
+
+    _target: Type = field(default_factory=lambda: SplatfactongfModel) 
+    output_depth_during_training: bool = True
+    # Add configuration parameters specific to this model
+    min_opacity: float = field(default=0.005)  # Original value, unchanged
+    """Minimum opacity value to be used in the model."""
+
+    n_offsets: int = field(default=7)  # Updated with Trial 2 value
+    """Number of offsets for Gaussian representations."""
+
+    feature_lr: float = field(default=0.003082157409452237)  # Updated with Trial 2 value
+    """Learning rate for feature parameters."""
+
+    opacity_lr: float = field(default=1.4557151971105535e-05)  # Updated with Trial 2 value
+    """Learning rate for opacity parameters."""
+
+    scaling_lr: float = field(default=7.636046410124476e-05)  # Updated with Trial 2 value
+    """Learning rate for scaling parameters."""
+
+    rotation_lr: float = field(default=0.0014932382448949136)  # Updated with Trial 2 value
+    """Learning rate for rotation parameters."""
+
+    mlp_opacity_lr_init: float = field(default=0.0057752182672979645)  # Updated with Trial 2 value
+    """Learning rate for opacity MLP initialization."""
+
+    mlp_cov_lr_init: float = field(default=0.0031913842262502722)  # Updated with Trial 2 value
+    """Learning rate for covariance MLP initialization."""
+
+    mlp_color_lr_init: float = field(default=7.891993908296452e-05)  # Updated with Trial 2 value
+    """Learning rate for color MLP initialization."""
+
+    appearance_lr_init: float = field(default=4.786070560048596e-06)  # Updated with Trial 2 value
+    """Learning rate for appearance embeddings."""
+
+    position_lr_init: float = field(default=5.9428157148740324e-05)  # Updated with Trial 2 value
+    """Learning rate for position parameters."""
+
+    offset_lr_init: float = field(default=1.3642335101835008e-05)  # Updated with Trial 2 value
+    """Learning rate for offset parameters."""
+
+    spatial_lr_scale: float = field(default=0.0003128278520242995)  # Updated with Trial 2 value
+    """Learning rate scale for spatial parameters."""
+
+    num_camera: int = field(default=1)  # Original value, unchanged
+    densify_until_num_points: int = field(default=1200000)  # Original value, unchanged
+    update_until: int = field(default=7000)  # Original value, unchanged
+    start_stat: int = field(default=500)  # Original value, unchanged
+    update_from: int = field(default=500)  # Original value, unchanged
+
+    voxel_size: float = field(default=0.00021754545216151966)  # Updated with Trial 2 value
+    """Voxel size for the model."""
+
+    success_threshold: float = field(default=0.8)  # Updated with Trial 2 value
+    """Success threshold for the model."""
+
+    check_interval: int = field(default=100)  # Original value, unchanged
+    """Interval to check for convergence."""
+
+    grad_threshold: float = field(default=0.0002)  # Original value, unchanged
+    """Gradient threshold for updates."""
+
+    update_depth: int = field(default=8)  # Updated with Trial 2 value
+    """Depth for updating parameters."""
+    
+
+
+
+
+
+
+
+class SplatfactongfModel(SplatfactoModel):
+    """Subclass of SplatfactoModel to implement Neural Gaussian Fields"""
+
+    config: SplatfactongfModelConfig
+
+    def __init__(
+        self,
+
+        *args,
+        **kwargs,
+       
+    ):
+
+
+
+        # Activation functions
+        self.scaling_activation = torch.exp
+        self.rotation_activation = torch.nn.functional.normalize
+        self.opacity_activation = torch.sigmoid
+        # Model parameters
+        self.feat_dim = 32
+        #self.n_offsets = 5
+        self.appearance_dim = 32
+        #self.min_opacity = 0.005
+        #self.success_threshold = 0.8
+        #self.check_interval = 100
+
+        # Dimension attributes
+        self.color_dist_dim = 1
+        self.cov_dist_dim = 1
+        self.opacity_dist_dim = 1
+        
+        self.update_hierachy_factor = 4
+        self.update_init_factor = 100
+
+        # Learning rates
+        #self.position_lr_init = 0.001
+        #self.offset_lr_init = 0.001
+        #self.feature_lr = 0.001
+        #self.opacity_lr = 0.001
+        #self.scaling_lr = 0.001
+        #self.rotation_lr = 0.001
+        #self.mlp_opacity_lr_init = 0.001
+        #self.mlp_cov_lr_init = 0.001
+        #self.mlp_color_lr_init = 0.001
+        #self.appearance_lr_init = 0.001
+        #self.spatial_lr_scale = 0
+        self.view_dim = 3
+        #self.voxel_size = 0.01
+
+        # Initialize tensors as empty
+
+
+        #self.spatial_lr_scale = 0.001
+
+        
+
+        self.add_color_dist=True
+
+        self.add_cov_dist=True
+        self.add_opacity_dist=True
+
+
+
+
+
+        super().__init__(*args, **kwargs)
+        if self.appearance_dim > 0:
+            self.embedding_appearance = Embedding(self.config.num_camera, self.appearance_dim).cuda()
+            self.embedding_appearance_rd = Embedding(self.config.num_camera, self.appearance_dim).cuda()
+        else:
+            self.embedding_appearance = None
+            self.embedding_appearance_rd = None
+        
+
+
+
+    
+
+    
+
+
+   
+    
+    
+    @property
+    def get_scaling(self):
+        return self.gauss_params["scales"]  
+
+    @property
+    def get_anchor(self):
+        return self.gauss_params["anchor"]
+
+
+    @property
+    def get_anchor_feat(self):
+        return self.gauss_params["anchor_feat"]
+
+    @property
+    def get_rotation(self):
+        return self.gauss_params["quats"]  
+    @property
+    def get_opacity_mlp(self):
+        return self.mlp_opacity
+    @property
+    def get_cov_mlp(self):
+        return self.mlp_cov
+    #@property
+    #def get_intensity_mlp(self):
+     #   return self.mlp_intensity  
+    @property
+    def get_featurebank_mlp(self):
+        return self.mlp_feature_bank 
+
+    @property
+    def get_color_mlp(self):
+        return self.mlp_color
+    
+    @property
+    def get_voxel_size(self):
+        """Getter for voxel_size."""
+        return self.config.voxel_size
+    
+    @property
+    def get_mlp_opacity(self):
+        return self.mlp_opacity
+    
+    @get_voxel_size.setter
+    def set_voxel_size(self, value: float):
+        """Setter for voxel_size."""
+        self.voxel_size = value
+
+
+    @property
+    def get_appearance(self):
+        return self.embedding_appearance
+    
+    @property
+    def get_appearance_rd(self):
+        return self.embedding_appearance_rd
+    
+    #@property
+    #def get_raydrop_mlp(self):
+     #   return self.raydrop_mlp
+    
+    @property
+    def get_opacity(self):
+        return self.gauss_params["opacities"]
+    
+    @property
+    def colors(self):
+        if self.config.sh_degree > 0:
+            return SH2RGB(self.get_anchor_feat)
+        else:
+            return torch.sigmoid(self.get_anchor_feat)
+    
+    
+
+    
+    #@get_anchor.setter
+    #def set_anchor(self, new_anchor):
+     #   assert self._anchor.shape == new_anchor.shape
+      #  del self._anchor
+       # torch.cuda.empty_cache()
+        #self._anchor = new_anchor
+
+    @property
+    def get_offset(self):
+        return self.gauss_params["offsets"]
+    
+
+    def voxelize_sample(self, data, voxel_size):
+        if isinstance(data, tuple):  # Check if it's a tuple
+            data = torch.cat(data, dim=0)  # Combine tensors if needed
+        np.random.shuffle(data)  # If manipulating NumPy array
+        data = np.unique(np.round(data / voxel_size), axis=0) * voxel_size
+        return data    
+
+
+    
+
+
+
+
+    def load_state_dict(self, state_dict, **kwargs):  # type: ignore
+        self.step = state_dict.get('step', 30000)  # Load step, default to 30000
+
+        # Handle backwards compatibility for older checkpoints
+        #if "means" in state_dict:
+         #   for p in  ["means", "scales", "quats",  "opacities", "offsets", "anchor", "anchor_feat"]:
+          #      state_dict[f"gauss_params.{p}"] = state_dict.pop(p)
+
+        num_loaded_gaussians = state_dict["gauss_params.means"].shape[0]
+
+
+      
+        resizable_params = [ "scales", "quats",  "opacities", "offsets", "anchor", "anchor_feat"]
+        for name in resizable_params:
+            param_key = f"gauss_params.{name}"
+            if param_key in state_dict:
+                loaded_param = state_dict[param_key]
+                if self.gauss_params[name].shape[0] != num_loaded_gaussians:
+                    new_shape = (num_loaded_gaussians,) + self.gauss_params[name].shape[1:]
+                    self.gauss_params[name] = nn.Parameter(torch.zeros(new_shape, device=self.device))
+                self.gauss_params[name].data = loaded_param.data # load data
+
+    
+
+
+
+
+
+    
+
+    
+
+    def get_camera_center(self,viewmat: torch.Tensor) -> torch.Tensor:
+        """
+       Given a world-to-camera matrix (viewmat), calculate the camera center in world coordinates.
+
+    Args:
+        viewmat: A tensor of shape [N, 4, 4] representing the world-to-camera matrix.
+
+    Returns:
+        A tensor of shape [N, 3] representing the positions of the camera center in the world.
+    """
+    # Extract the fourth column (translate part) and invert it
+        T = viewmat[:, :3, 3]  # Extract the translation component (x, y, z)
+    
+    # Since viewmat is the inverse of the camera-to-world transformation,
+    # The camera center in world coordinates is given by -R_inv * T
+    # However, since viewmat = [R_inv | T_inv], the camera center is just the third column:
+        camera_center = -T  # Negate since it's inverted in view matrix
+        return camera_center
+    
+
+            
+
+
+       
+
+    #def _prune_anchor_optimizer(self, mask,optimizers: Optimizers):
+     #   optimizable_tensors = {}
+ #
+  #      for param_group_name, params in optimizers.parameters.items():  # Ensure you're unpacking correctly
+        # Print out parameters for debugging
+   #       
+    #        if  'mlp' in param_group_name or \
+     #           'unet' in param_group_name or \
+      #          'enc_dir' in param_group_name or \
+       #         'enc_i_d' in param_group_name or \
+        #        'enc_pos' in param_group_name or \
+         #       'conv' in param_group_name or \
+          #      'feat_base' in param_group_name or \
+           #     'embedding' in param_group_name:
+            #    continue
+
+        # Retrieve the optimizer's state for the current parameter group
+            #stored_state = optimizers.optimizers[param_group_name].state.get(params[0], None)
+
+
+            #if stored_state is not None:
+            # Update the stored states based on the mask
+               
+             #   if "exp_avg" in stored_state:
+              #    stored_state['exp_avg'] = stored_state['exp_avg'][mask]
+               #   stored_state['exp_avg_sq'] = stored_state['exp_avg_sq'][mask]
+               
+        # Update parameters using the mask and ensure they require gradients
+                #prm = optimizers.optimizers[param_group_name].param_groups[0]["params"][0]
+                #del optimizers.optimizers[param_group_name].state[prm]
+
+                #new_param = nn.Parameter(params[0][mask].requires_grad_(True))
+                #params[0] = new_param  # Update the parameter in the group
+
+
+                #optimizers.optimizers[param_group_name].state[prm] = stored_state
+        # If this is the scaling group, apply additional constraints
+                #if param_group_name == "scales":
+                 #  scales = params[0]
+                  # temp = scales[:, 3:]
+                   #temp[temp > 0.05] = 0.05
+                   #scales[:, 3:] = temp  # Modify the original parameter
+
+        # Update the optimizer's state with the modified parameters
+                #optimizers.optimizers[param_group_name].state[params[0]] = stored_state 
+
+        # Store the modified parameter tensor in the output dictionary
+                #optimizable_tensors[param_group_name] = params[0]
+            #else:
+             #   params[0] = nn.Parameter((params[0])[mask].requires_grad_(True))
+              
+              #  if param_group_name == "scales":
+               #    scales = params[0]
+                #   temp = scales[:, 3:]
+                 #  temp[temp > 0.05] = 0.05
+                  # scales[:, 3:] = temp 
+                #optimizable_tensors[param_group_name] = params[0]
+        #return optimizable_tensors
+
+    def remove_from_optim(self, optimizer, deleted_mask, new_params):
+        """removes the deleted_mask from the optimizer provided"""
+        assert len(new_params) == 1
+        # assert isinstance(optimizer, torch.optim.Adam), "Only works with Adam"
+
+        param = optimizer.param_groups[0]["params"][0]
+        param_state = optimizer.state[param]
+        del optimizer.state[param]
+
+        # Modify the state directly without deleting and reassigning.
+        if "exp_avg" in param_state:
+            param_state["exp_avg"] = param_state["exp_avg"][~deleted_mask]
+            param_state["exp_avg_sq"] = param_state["exp_avg_sq"][~deleted_mask]
+
+        # Update the parameter in the optimizer's param group.
+        del optimizer.param_groups[0]["params"][0]
+        del optimizer.param_groups[0]["params"]
+        optimizer.param_groups[0]["params"] = new_params
+        optimizer.state[new_params[0]] = param_state
+
+    def remove_from_all_optim(self, optimizers, deleted_mask):
+        param_groups = self.get_gaussian_param_groups()
+        for group, param in param_groups.items():
+            self.remove_from_optim(optimizers.optimizers[group], deleted_mask, param)
+        torch.cuda.empty_cache()
+
+    def populate_modules(self):
+        
+
+        """Override the populate_modules to include Gaussian-specific initializations."""
+
+
+        # Additional parameters for neural gaussian fields
+        # Assume the necessary parameters are defined properly in the SplatfactoModelConfig.
+
+        # Initialize the MLPs as in your previous code
+
+        super().populate_modules() 
+        # add Chamfer Distance metric
+        self.chamfer_distance = lambda pred, gt: chamfer_distance(pred, gt, 1_000, True)
+
+        # add RMSE for geometry eval
+        # self.geo_rmse = lambda pred, gt: rmse_metric(pred, gt)
+        self.geo_rmse = lambda pred, gt: torch.sqrt(torch.mean((pred - gt) ** 2))
+        self.median_l1 = lambda pred, gt: torch.median(abs(pred - gt))
+        self.median_l2 = lambda pred, gt: torch.median((pred - gt) ** 2)
+        self.opacity_accum = None
+        self.offset_gradient_accum = None
+        self.offset_denom = None
+    
+        self.anchor_demon = None
+
+ 
+
+        
+
+        dim_sh = num_sh_bases(self.config.sh_degree)
+        dim_sh = num_sh_bases(self.config.sh_degree)
+     
+
+        
+        self.mlp_color = ColorMLP(self.feat_dim, self.config.n_offsets, self.color_dist_dim, self.appearance_dim).cuda()
+        self.mlp_cov = CovarianceMLP(self.feat_dim, self.config.n_offsets, self.cov_dist_dim).cuda()
+        self.mlp_feature_bank = FeatureBankMLP().cuda() # Adapt the init params as needed
+        self.mlp_opacity = OpacityMLP(self.feat_dim, self.config.n_offsets, self.opacity_dist_dim).cuda()
+        self.raydrop_mlp = Raydrop_probability(self.feat_dim,self.color_dist_dim,self.appearance_dim, self.config.n_offsets).cuda()
+
+        #if self.seed_points is not None:
+            
+        fused_point_cloud = self.voxelize_sample(self.seed_points,self.config.voxel_size)
+        #else:
+         #   fused_point_cloud = self.voxelize_sample((torch.rand((self.config.num_random, 3)) - 0.5) * self.config.random_scale, 0.01)
+
+
+
+       
+         
+          
+
+
+        dist2 = (knn(fused_point_cloud, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
+        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 6)
+        quats = torch.zeros((fused_point_cloud.shape[0], 4))
+        quats[:, 0] = 1
+        anchor = nn.Parameter(torch.tensor(fused_point_cloud)).requires_grad_(True).cuda()
+         
+
+        
+        offsets = torch.zeros((fused_point_cloud.shape[0], self.config.n_offsets, 3)).float()
+
+        anchors_feat = torch.zeros((fused_point_cloud.shape[0], self.feat_dim)).float()
+        
+       
+
+
+        offset = nn.Parameter(offsets).requires_grad_(True).cuda()
+        anchor_feat = nn.Parameter(anchors_feat).requires_grad_(True).cuda()
+        scaling = nn.Parameter(scales).requires_grad_(True).cuda()
+          
+        opacities = inverse_sigmoid(0.5 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float))
+        opacity = nn.Parameter(opacities).requires_grad_(False).cuda()
+        rotation = nn.Parameter(quats).requires_grad_(False).cuda()
+
+
+        
+        #visible_mask = torch.ones(self.get_anchor.shape[0], dtype=torch.bool, device = self.get_anchor.device)
+        #feat = self._anchor_feat[visible_mask]
+        #self.anchor = self.get_anchor[visible_mask]
+        #grid_offsets = self._offset[visible_mask]
+        #self.grid_scaling = self.get_scaling[visible_mask]           
+
+        
+
+        self.gauss_params = torch.nn.ParameterDict(
+            {
+               
+                "scales": scaling,
+                "quats": rotation,
+                "opacities": opacity,
+                "offsets": offset,
+                "anchor": anchor,
+                "anchor_feat": anchor_feat,
+
+            }
+        )    
+
+  
+    
+    
+    def get_gaussian_param_groups(self) -> Dict[str, List[Parameter]]:
+        # Here we explicitly use the means, scales as parameters so that the user can override this function and
+        # specify more if they want to add more optimizable params to gaussians.
+        return {
+            name: [self.gauss_params[name]]
+            for name in ["scales", "quats", "opacities", "offsets", "anchor", "anchor_feat"]
+
+         }
+
+    def get_param_groups(self) -> Dict[str, List[Parameter]]:
+        """Obtain the parameter groups for the optimizers
+
+        Returns:
+            Mapping of different parameter groups
+        """
+        gps = self.get_gaussian_param_groups()
+        if self.config.use_bilateral_grid:
+            gps["bilateral_grid"] = list(self.bil_grids.parameters())
+        gps["mlp_feature_bank"] = list(self.mlp_feature_bank.parameters())
+        gps["mlp_opacity"] = list(self.mlp_opacity.parameters())
+        gps["mlp_cov"] = list(self.mlp_cov.parameters())
+        gps["mlp_color"] = list(self.mlp_color.parameters())
+        #gps["raydrop_mlp"] = list(self.raydrop_mlp.parameters())
+        gps["embedding_appearance"] = list(self.embedding_appearance.parameters())
+        #gps["embedding_appearance_rd"] = list(self.embedding_appearance_rd.parameters())
+
+
+
+        
+
+            
+        self.camera_optimizer.get_param_groups(param_groups=gps)
+        return gps
+
+    def get_metrics_dict(self, outputs, batch) -> Dict[str, torch.Tensor]:
+        """Compute and returns metrics.
+
+        Args:
+            outputs: the output to compute loss dict to
+            batch: ground truth batch corresponding to outputs
+        """
+        gt_rgb = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
+        metrics_dict = {}
+        predicted_rgb = outputs["rgb"]
+
+        metrics_dict["psnr"] = self.psnr(predicted_rgb, gt_rgb)
+        if self.config.color_corrected_metrics:
+            cc_rgb = color_correct(predicted_rgb, gt_rgb)
+            metrics_dict["cc_psnr"] = self.psnr(cc_rgb, gt_rgb)
+
+        metrics_dict["gaussian_count"] = self.get_anchor.shape[0]*self.config.n_offsets
+
+        self.camera_optimizer.get_metrics_dict(metrics_dict)
+        return metrics_dict
+        
+    def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
+        """Computes and returns the losses dict.
+
+        Args:
+            outputs: the output to compute loss dict to
+            batch: ground truth batch corresponding to outputs
+            metrics_dict: dictionary of metrics, some of which we can use for loss
+        """
+        gt_img = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
+        pred_img = outputs["rgb"]
+
+        # Set masked part of both ground-truth and rendered image to black.
+        # This is a little bit sketchy for the SSIM loss.
+        if "mask" in batch:
+            # batch["mask"] : [H, W, 1]
+            mask = self._downscale_if_required(batch["mask"])
+            mask = mask.to(self.device)
+            assert mask.shape[:2] == gt_img.shape[:2] == pred_img.shape[:2]
+            gt_img = gt_img * mask
+            pred_img = pred_img * mask
+
+        Ll1 = torch.abs(gt_img - pred_img).mean()
+        simloss = 1 - self.ssim(gt_img.permute(2, 0, 1)[None, ...], pred_img.permute(2, 0, 1)[None, ...])
+        if self.config.use_scale_regularization and self.step % 10 == 0:
+            scale_exp = torch.exp(self.scales)
+            scale_reg = (
+                torch.maximum(
+                    scale_exp.amax(dim=-1) / scale_exp.amin(dim=-1),
+                    torch.tensor(self.config.max_gauss_ratio),
+                )
+                - self.config.max_gauss_ratio
+            )
+            scale_reg = 0.1 * scale_reg.mean()
+        else:
+            scale_reg = torch.tensor(0.0).to(self.device)
+
+        loss_dict = {
+            "main_loss": (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss,
+            "scale_reg": scale_reg,
+        }
+        total_loss = loss_dict["main_loss"] + loss_dict["scale_reg"]
+        print("Total Loss:", total_loss)
+
+        if self.training:
+            # Add loss from camera optimizer
+            self.camera_optimizer.get_loss_dict(loss_dict)
+            if self.config.use_bilateral_grid:
+                loss_dict["tv_loss"] = 10 * total_variation_loss(self.bil_grids.grids)
+
+        return loss_dict
+
+
+
+
+
+
+    
+      
+
+
+
+        
+
+
+
+
+           
+
+    def after_train(self, step: int):
+
+        assert step == self.step
+    # To save some training time, we no longer need to update those stats post refinement
+        if self.step >= self.config.stop_split_at:
+           return
+
+
+
+        with torch.no_grad():
+        # Create a mask for valid radii
+                anchor_visible_mask = (self.radii2>0).flatten()
+
+                #anchor_visible_mask = (self.radii2>0).flatten()
+                visible_mask =(self.radii>0).flatten()
+                opac = self.opacity
+                absgrads = torch.norm(self.xys.grad[visible_mask.unsqueeze(0)], dim=-1, keepdim=True)# type: ignore           
+                #anchor_visible_mask =  torch.ones(self.get_anchor.shape[0], dtype=torch.bool, device=self.get_anchor.device)
+                if self.offset_gradient_accum is None :
+                   self.offset_gradient_accum = torch.zeros((self.get_anchor.shape[0]*self.config.n_offsets, 1), device="cuda",dtype=torch.float32)
+                if self.offset_denom is None :
+                   self.offset_denom = torch.zeros((self.get_anchor.shape[0]*self.config.n_offsets, 1), device="cuda",dtype=torch.float32)
+                if self.anchor_demon is None :
+                   self.anchor_demon = torch.zeros((self.get_anchor.shape[0], 1), device="cuda",dtype=torch.float32)
+                if self.opacity_accum is None :
+                   self.opacity_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda",dtype=torch.float32)
+                assert self.opacity_accum is not None                                   
+
+
+
+            # print(f"grad norm min {grads.min().item()} max {grads.max().item()} mean {grads.mean().item()} size {grads.shape}")
+
+               #self.xys_grad_norm = torch.zeros(self.radii.shape[0], device=self.device, dtype=torch.float32)
+            #self.vis_counts = torch.ones(self.radii.shape[0], device=self.device, dtype=torch.float32)
+
+
+                temp_opacity = opac.clone().view(-1).detach()
+                temp_opacity[temp_opacity<0] = 0
+                temp_opacity = temp_opacity.view([-1, self.config.n_offsets])
+
+                self.opacity_accum[anchor_visible_mask] += temp_opacity.sum(dim=1, keepdim=True)
+
+            # update anchor visiting statis
+                self.anchor_demon[anchor_visible_mask] += 1
+            # update neural gaussian statis
+                anchor_visible_mask = anchor_visible_mask.unsqueeze(dim=1).repeat([1, self.config.n_offsets]).view(-1)
+                combined_mask = torch.zeros_like(self.offset_gradient_accum, dtype=torch.bool).squeeze(dim=1)
+                mask = (opac>0.0)
+             
+                combined_mask[anchor_visible_mask] = mask
+                temp_mask = combined_mask.clone()
+                combined_mask[temp_mask] = visible_mask
+
+            # update the max screen size, as a ratio of number of pixels
+                if self.max_2Dsize is None:
+                   self.max_2Dsize = torch.zeros_like(self.radii, dtype=torch.float32)
+                   newradii = self.radii.detach()[visible_mask]
+                   self.max_2Dsize[visible_mask] = torch.maximum(
+                self.max_2Dsize[visible_mask],
+                newradii / float(max(self.last_size[0], self.last_size[1])),
+            )
+
+        
+
+            #abs_grad_norm = torch.norm(self.xys.grad[0][visible_mask, 2:], dim=-1,keepdim=True)
+               
+                
+
+                #self.offset_gradient_accum = (self.offset_gradient_accum[combined_mask])[:absgrads.shape[0]]
+                self.offset_gradient_accum[combined_mask] += absgrads #grad_norm
+                self.offset_denom[combined_mask] += 1
+
+
+
+
+    def anchor_growing(self, grads, threshold, offset_mask,optimizers: Optimizers):
+        ## 
+        init_length = self.get_anchor.shape[0]*self.config.n_offsets
+        for i in range(self.config.update_depth):
+            # update threshold
+            cur_threshold = threshold*((self.update_hierachy_factor//2)**i)
+            # mask from grad threshold
+            candidate_mask = (grads >= cur_threshold)
+            candidate_mask = torch.logical_and(candidate_mask, offset_mask)
+            
+            # random pick
+            rand_mask = torch.rand_like(candidate_mask.float())>(0.5**(i+1))
+            rand_mask = rand_mask.cuda()
+            candidate_mask = torch.logical_and(candidate_mask, rand_mask)
+            
+            length_inc = self.get_anchor.shape[0]*self.config.n_offsets - init_length
+            if length_inc == 0:
+                if i > 0:
+                    continue
+            else:
+                candidate_mask = torch.cat([candidate_mask, torch.zeros(length_inc, dtype=torch.bool, device='cuda')], dim=0)
+
+            all_xyz = self.get_anchor.unsqueeze(dim=1) + self.get_offset * 1.0*self.scaling_activation(self.get_scaling)[:,:3].unsqueeze(dim=1)
+          
+            # assert self.update_init_factor // (self.update_hierachy_factor**i) > 0
+            # size_factor = min(self.update_init_factor // (self.update_hierachy_factor**i), 1)
+            size_factor = self.update_init_factor // (self.update_hierachy_factor**i)
+            cur_size = self.config.voxel_size *size_factor
+            
+            grid_coords = torch.round(self.get_anchor / cur_size).int()
+
+            selected_xyz = all_xyz.view([-1, 3])[candidate_mask]
+            selected_grid_coords = torch.round(selected_xyz / cur_size).int()
+
+            selected_grid_coords_unique, inverse_indices = torch.unique(selected_grid_coords, return_inverse=True, dim=0)
+
+
+
+          
+            candidate_anchor = selected_grid_coords_unique*cur_size
+
+            
+            if candidate_anchor.shape[0] > 0:
+                new_scaling = torch.ones_like(candidate_anchor).repeat([1,2]).float().cuda()*cur_size # *0.05
+                new_scaling = torch.log(new_scaling)
+
+               
+                
+                new_rotation = torch.zeros([candidate_anchor.shape[0], 4], device=candidate_anchor.device).float()
+                new_rotation[:,0] = 1.0
+
+                
+                new_opacities = inverse_sigmoid(0.1 * torch.ones((candidate_anchor.shape[0], 1), dtype=torch.float, device="cuda"))
+
+                new_feat = self.get_anchor_feat.unsqueeze(dim=1).repeat([1, self.config.n_offsets, 1]).view([-1, self.feat_dim])[candidate_mask]
+                
+                new_feat = scatter_max(new_feat, inverse_indices.unsqueeze(1).expand(-1, new_feat.size(1)), dim=0)[0]
+
+                new_offsets = torch.zeros_like(candidate_anchor).unsqueeze(dim=1).repeat([1,self.config.n_offsets,1]).float().cuda()
+
+                
+                
+                d = {
+                    "anchor": candidate_anchor,
+                    "scales": new_scaling,
+                    "quats": new_rotation,
+                    "anchor_feat": new_feat,
+                    "offsets": new_offsets,
+                    "opacities": new_opacities,
+                }
+                
+
+                temp_anchor_demon = torch.cat([self.anchor_demon, torch.zeros([new_opacities.shape[0], 1], device='cuda').float()], dim=0)
+                del self.anchor_demon
+                self.anchor_demon = temp_anchor_demon
+
+                temp_opacity_accum = torch.cat([self.opacity_accum, torch.zeros([new_opacities.shape[0], 1], device='cuda').float()], dim=0)
+                del self.opacity_accum
+                self.opacity_accum = temp_opacity_accum
+
+                torch.cuda.empty_cache()
+                
+                for name, param in self.gauss_params.items():
+                    if name not in d:
+                       d[name] = param[candidate_mask]
+                for name, param in self.gauss_params.items():
+                    self.gauss_params[name] = torch.nn.Parameter(
+                        torch.cat([param.detach(), d[name]], dim=0)
+                    )
+                
+                self.dup_in_all_optim(optimizers, d, 1)
+    def dup_in_all_optim(self, optimizers, dup_mask, n):
+        param_groups = self.get_gaussian_param_groups()
+        
+        for group, param in param_groups.items():
+            extension_tensor = dup_mask[group]
+            self.dup_in_optim(optimizers.optimizers[group], extension_tensor, param, n)
+    def dup_in_optim(self, optimizer, dup_mask, new_params, n=2):
+        """adds the parameters to the optimizer"""
+        param = optimizer.param_groups[0]["params"][0]
+        
+        
+        param_state = optimizer.state[param]
+        
+        
+        if "exp_avg" in param_state:
+            
+            repeat_dims = (n,) + tuple(1 for _ in range(param_state["exp_avg"].dim() - 1))
+            param_state["exp_avg"] = torch.cat(
+                [
+                    param_state["exp_avg"],
+                    torch.zeros_like(dup_mask).repeat(*repeat_dims),
+                ],
+                dim=0,
+            )
+
+            param_state["exp_avg_sq"] = torch.cat(
+                [
+                    param_state["exp_avg_sq"],
+                    torch.zeros_like(dup_mask).repeat(*repeat_dims),
+                ],
+                dim=0,
+            )
+        del optimizer.state[param]
+        optimizer.state[new_params[0]] = param_state
+        optimizer.param_groups[0]["params"] = new_params
+        del param
+         
+              
+    def prune_anchor(self,mask):
+        valid_points_mask = ~mask
+        #print(valid_points_mask.shape)
+
+        for name, param in self.gauss_params.items():
+            self.gauss_params[name] = torch.nn.Parameter(param[valid_points_mask])
+
+
+    def _prune_anchor_optimizer(self, mask, optimizers: Optimizers):
+         optimizable_tensors = {}
+    
+         param_groups = self.gauss_params
+         for group, par in param_groups.items():
+            opti = optimizers.optimizers[group]
+            current_param = opti.param_groups[0]["params"][0]
+            param_state = opti.state[current_param]
+        
+        # Remove the current parameter from the optimizer's state
+            del opti.state[current_param]
+        
+        # Modify the state based on the mask
+            if "exp_avg" in param_state:
+                param_state["exp_avg"] = param_state["exp_avg"][mask]
+                param_state["exp_avg_sq"] = param_state["exp_avg_sq"][mask]
+
+        # Create a new parameter tensor that respects the mask
+            new_param = nn.Parameter((par[mask]).requires_grad_(True))
+        
+        # Update the parameter in the optimizer's parameter group
+            opti.state[new_param] = param_state
+            opti.param_groups[0]["params"] = new_param
+        
+        # Store the new parameter
+            optimizable_tensors[group] = new_param
+            
+         return optimizable_tensors
+        
+    def cat_tensors_to_optimizer(self, tensors_dict, optimizers: Optimizers):
+         optimizable_tensors = {}
+         param_groups = self.gauss_params
+
+         for group, par in param_groups.items():
+        # Skip certain groups based on naming conventions
+           if any(substring in group for substring in ['mlp', 'unet', 'enc_dir', 'enc_i_d', 'enc_pos', 'conv', 'feat_bank', 'means', 'rest', 'dc', 'embedding']):
+              continue
+            
+           opti = optimizers.optimizers[group]
+           current_param = opti.param_groups[0]["params"][0]
+           param_state = opti.state[current_param]
+        
+           extension_tensor = tensors_dict[group]
+
+        # Expand optimizer states for new parameters
+           if "exp_avg" in param_state:
+               new_exp_avg = torch.cat((param_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=0)
+               new_exp_avg_sq = torch.cat((param_state["exp_avg_sq"], torch.zeros_like(extension_tensor)), dim=0)
+
+            # Clear the current state before reassigning
+               del opti.state[current_param]
+           else:
+            # If exp_avg doesn't exist in the state, initialize them
+              new_exp_avg = torch.zeros_like(extension_tensor)
+              new_exp_avg_sq = torch.zeros_like(extension_tensor)
+
+        # Create new parameter tensor with the appended extension
+           new_param = nn.Parameter(torch.cat((par, extension_tensor), dim=0).requires_grad_(True))
+
+        # Update optimizer state with the new parameters
+           opti.state[new_param] = {
+            "exp_avg": new_exp_avg,
+            "exp_avg_sq": new_exp_avg_sq
+        }
+           opti.param_groups[0]["params"] = new_param
+
+        # Store the new parameter for return
+           optimizable_tensors[group] = new_param
+
+         return optimizable_tensors
+
+
+
+    
+            
+
+  
+    def refinement_after(self, optimizers: Optimizers, step):
+        assert step == self.step
+        if self.step <= self.config.warmup_length:
+           return
+
+        with torch.no_grad():
+        # Initiate density adjustment
+            reset_interval = self.config.reset_alpha_every * self.config.refine_every
+            do_densification = (
+            self.step < self.config.stop_split_at
+            and self.step % reset_interval > self.num_train_data + self.config.refine_every #and self.get_anchor.shape[0]*self.config.n_offsets < self.config.densify_until_num_points
+        )
+            
+            if do_densification:
+            # Prepare gradients for processing
+              assert self.offset_gradient_accum is not None and self.offset_denom is not None and self.anchor_demon is not None and self.opacity_accum is not None
+              assert self.max_2Dsize is not None
+              grads = self.offset_gradient_accum / self.offset_denom  # Calculate normalized gradients
+              grads = grads.squeeze(dim=1)
+              grads[grads.isnan()] = 0.0
+              grads_norm = torch.norm(grads, dim=-1)
+
+              offset_mask = (self.offset_denom > self.config.check_interval * self.config.success_threshold * 0.5).squeeze(dim=1)
+             
+            # Call  anchor growing function based on the gradients
+              print(self.get_anchor.shape[0]*self.config.n_offsets)
+        
+              self.anchor_growing(grads_norm, self.config.grad_threshold, offset_mask,optimizers)
+
+             
+             
+            # Reset the offset denominators
+              self.offset_denom[offset_mask] = 0
+              padding_offset_denom = torch.zeros([self.get_anchor.shape[0] * self.config.n_offsets - self.offset_denom.shape[0], 1],
+                                                dtype=torch.int32, 
+                                                device=self.offset_denom.device)
+              self.offset_denom = torch.cat([self.offset_denom, padding_offset_denom], dim=0)
+
+            # Reset gradient accumulators
+              self.offset_gradient_accum[offset_mask] = 0
+              padding_offset_gradient_accum = torch.zeros([self.get_anchor.shape[0] * self.config.n_offsets - self.offset_gradient_accum.shape[0], 1],
+                                                         dtype=torch.int32, 
+                                                         device=self.offset_gradient_accum.device)
+              self.offset_gradient_accum = torch.cat([self.offset_gradient_accum, padding_offset_gradient_accum], dim=0)
+            
+  
+            # Pruning: Identify anchors to remove
+              prune_mask = (self.opacity_accum < self.config.min_opacity * self.anchor_demon).squeeze(dim=1)
+              anchors_mask = (self.anchor_demon > self.config.check_interval * self.config.success_threshold).squeeze(dim=1)
+              prune_mask = torch.logical_and(prune_mask, anchors_mask)
+              #print(prune_mask.shape)
+              #print(self.get_anchor.shape)
+            # Update offset_denom based on prune_mask
+              offset_denom = self.offset_denom.view([-1, self.config.n_offsets])[~prune_mask]
+              offset_denom = offset_denom.view([-1, 1])
+              del self.offset_denom
+              self.offset_denom = offset_denom
+
+            # Update offset_gradient_accum based on prune_mask
+              offset_gradient_accum = self.offset_gradient_accum.view([-1, self.config.n_offsets])[~prune_mask]
+              offset_gradient_accum = offset_gradient_accum.view([-1, 1])
+              del self.offset_gradient_accum
+              self.offset_gradient_accum = offset_gradient_accum
+
+            # Update opacity accumulators for visible anchors
+              if anchors_mask.sum() > 0:
+                self.opacity_accum[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device='cuda').float()
+                self.anchor_demon[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device='cuda').float()
+
+            # Clean up opacity accum for pruned anchors
+              temp_opacity_accum = self.opacity_accum[~prune_mask]
+          
+              del self.opacity_accum
+              self.opacity_accum = temp_opacity_accum
+
+            # Clean up anchor demon for pruned anchors
+              temp_anchor_demon = self.anchor_demon[~prune_mask]
+              del self.anchor_demon
+              self.anchor_demon = temp_anchor_demon
+
+            # Execute pruning operation for redundant anchors
+              if prune_mask.shape[0] > 0:
+                    self.prune_anchor(prune_mask)
+              
+                    self.remove_from_all_optim(optimizers, prune_mask)               
+
+
+       
+              
+                 
+            self.max_radii2D = None
+            self.anchor_demon =None
+            self.offset_denom = None
+            self.offset_gradient_accum = None
+            self.opacity_accum = None
+    
+    def get_outputs(self, camera: Cameras) -> dict[str, Union[torch.Tensor, List]]:
+       """Takes in a camera and returns a dictionary of outputs for neural Gaussian fields.
+
+    Args:
+        camera: The camera(s) for which output images are rendered. It should have
+        all the needed information to compute the outputs.
+
+    Returns:
+        Outputs of the model (e.g., rendered colors).
+
+    """
+
+        
+
+
+
+
+        #self.mlp_intensity = nn.Sequential(
+         #   nn.Linear(self.feat_dim + self.view_dim + self.appearance_dim, self.feat_dim),
+          #  nn.ReLU(True),
+           # nn.Linear(self.feat_dim, 1),
+            #nn.Sigmoid(),
+        #).cuda()
+
+        #self.mlp_ray_drop_probability = nn.Sequential(
+         #   nn.Linear(self.feat_dim + self.view_dim + self.appearance_dim, self.feat_dim),
+          #  nn.ReLU(True),
+           # nn.Linear(self.feat_dim, 1),
+        #).cuda()
+
+
+
+
+       feat_dim = 32
+
+
+
+        
+       if not isinstance(camera, Cameras):
+           print("Called get_outputs with not a camera")
+           return {}
+
+       if self.training:
+          assert camera.shape[0] == 1, "Only one camera at a time"
+          optimized_camera_to_world = self.camera_optimizer.apply_to_camera(camera)
+       else:
+          optimized_camera_to_world = camera.camera_to_worlds
+
+    # Perform cropping if applicable
+       if self.crop_box is not None and not self.training:
+          crop_ids = self.crop_box.within(self.get_anchor).squeeze()
+          if crop_ids.sum() == 0:
+            return self.get_empty_outputs(
+                int(camera.width.item()), int(camera.height.item()), self.background_color
+            )
+       else:
+           crop_ids = None
+
+    # Activate the generation of neural Gaussians
+       if crop_ids is not None:
+          visibility_mask = crop_ids
+       else:
+          visibility_mask = None
+
+
+
+
+    # Now proceed with rendering based on the generated parameters
+    # Assuming xyz is now processed, and we have the required outputs
+       BLOCK_WIDTH = 16  # Tile size for rasterization
+       camera_scale_fac = self._get_downscale_factor()
+       camera.rescale_output_resolution(1 / camera_scale_fac)
+       viewmat = get_viewmat(optimized_camera_to_world)
+       K = camera.get_intrinsics_matrices().cuda()
+       W, H = int(camera.width.item()), int(camera.height.item())
+       self.last_size = (H, W)
+       camera.rescale_output_resolution(camera_scale_fac)  # Adjust back after operating
+       viewmat = get_viewmat(optimized_camera_to_world)
+       camera_center = self.get_camera_center(viewmat)
+       if self.config.output_depth_during_training or not self.training:
+            render_mode = "RGB+ED"
+       else:
+            render_mode = "RGB"
+       render2, alpha2, info2 = rasterization(
+        means=self.get_anchor.float(),
+        quats=self.rotation_activation(self.get_rotation,dim=0).float(),  # Assuming you've computed or collected these values
+        scales=1.0*self.scaling_activation(self.get_scaling)[:,:3].float(),
+        opacities=self.opacity_activation(self.get_opacity).squeeze().float(),
+        colors=self.colors.float(),
+        viewmats=viewmat,
+        Ks=K,
+        width=W,
+        height=H,
+        tile_size=BLOCK_WIDTH,
+        packed=False,
+        near_plane=0.0,
+        far_plane=80.0,
+        render_mode=render_mode,  # Adjust according to requirement
+        sh_degree=None,  # Pass if needed
+        sparse_grad=False,
+        absgrad=True,
+        rasterize_mode=self.config.rasterize_mode,
+    )
+       self.xys2 = info2["means2d"]  # [1, N, 2]
+       self.radii2 = info2["radii"][0]  # [N]       
+       visible_mask = (self.radii2>0).flatten()
+       anchor = self.get_anchor[visible_mask]   
+       ob_view = anchor - camera_center
+    # dist
+       ob_dist = ob_view.norm(dim=1, keepdim=True)
+    # view
+       ob_view = ob_view / ob_dist
+
+       cat_view = torch.cat([ob_view, ob_dist], dim=1)
+        
+       bank_weight = self.get_featurebank_mlp(cat_view).unsqueeze(dim=1) # [n, 1, 3]
+
+        ## multi-resolution feat
+       feat = self.get_anchor_feat[visible_mask] 
+       feat = feat.unsqueeze(dim=-1)
+       feat = feat[:,::4, :1].repeat([1,4,1])*bank_weight[:,:,:1] + \
+            feat[:,::2, :1].repeat([1,2,1])*bank_weight[:,:,1:2] + \
+            feat[:,::1, :1]*bank_weight[:,:,2:]
+       feat = feat.squeeze(dim=-1) # [n, c]
+       cat_local_view = torch.cat([feat, ob_view, ob_dist], dim=1) # [N, c+3+1]
+       cat_local_view_wodist = torch.cat([feat, ob_view], dim=1) # [N, c+3]
+       num_cameras = optimized_camera_to_world.shape[0]  # Number of cameras
+       uid = torch.arange(num_cameras)
+
+
+
+       camera_indicies = torch.ones_like(cat_local_view[:,0], dtype=torch.long) * uid.cuda()
+        # camera_indicies = torch.ones_like(cat_local_view[:,0], dtype=torch.long, device=ob_dist.device) * 10
+
+       appearance = None
+       appearance_rd = None
+       if self.embedding_appearance is not None:
+            if self.training:
+                appearance = self.embedding_appearance(camera_indicies)
+               # appearance_rd = self.embedding_appearance_rd(camera_indicies)
+            else:
+                appearance = self.embedding_appearance(camera_indicies)
+                #appearance_rd = self.embedding_appearance_rd(camera_indicies)
+       if self.add_opacity_dist:
+          neural_opacity = self.get_opacity_mlp(cat_local_view) # [N, k]
+       else:
+          neural_opacity = self.get_opacity_mlp(cat_local_view_wodist)
+
+       neural_opacity = neural_opacity.reshape([-1, 1])
+
+       
+       mask = (neural_opacity>0.0)
+       mask = mask.view(-1)
+
+       opacity = neural_opacity[mask]
+       opacity = opacity.squeeze(dim = 1)
+       opacity=opacity.float()
+       neural_opacity = neural_opacity.squeeze(dim = 1)
+
+       neural_opacity = neural_opacity
+
+
+
+       if self.appearance_dim > 0:
+          if self.add_color_dist:
+             color = self.get_color_mlp(torch.cat([cat_local_view, appearance], dim=1))
+             #raydrop = self.get_raydrop_mlp(torch.cat([cat_local_view, appearance_rd], dim=1))
+          else:
+             color = self.get_color_mlp(torch.cat([cat_local_view_wodist, appearance], dim=1))
+             #raydrop = self.get_raydrop_mlp(torch.cat([cat_local_view_wodist, appearance_rd], dim=1))
+
+       else:
+         if self.add_color_dist:
+            color = self.get_color_mlp(cat_local_view)
+         else:
+            color = self.get_color_mlp(cat_local_view_wodist)
+       color1 = color.reshape([anchor.shape[0]*self.config.n_offsets, 3])# [mask]
+       #raydrop = raydrop.reshape([anchor.shape[0]*self.n_offsets, 1])
+       #color1 = torch.cat([color1,raydrop],dim=1) 
+           # get offset's cov
+       if self.add_cov_dist:
+          scale_rot = self.mlp_cov(cat_local_view)
+       else:
+          scale_rot = self.mlp_cov(cat_local_view_wodist)
+       scale_rot = scale_rot.reshape([anchor.shape[0]*self.config.n_offsets, 7]) # [mask]
+       grid_offsets = self.get_offset[visible_mask]
+       offsets = grid_offsets.view([-1, 3]) # [mask]
+
+    # combine for parallel masking
+       grid_scaling = 1.0*self.scaling_activation(self.get_scaling)[visible_mask]
+       concatenated = torch.cat([grid_scaling, anchor], dim=-1)
+       concatenated_repeated = repeat(concatenated, 'n (c) -> (n k) (c)', k=self.config.n_offsets)
+       concatenated_all = torch.cat([concatenated_repeated, color1, scale_rot, offsets], dim=-1)
+
+       masked = concatenated_all[mask]
+       scaling_repeat, repeat_anchor, color, scale_rot, offsets = masked.split([6,3,3, 7, 3], dim=-1)
+       color = color.float()
+
+    # post-process cov
+       scaling = scaling_repeat[:,3:] * torch.sigmoid(scale_rot[:,:3]) # * (1+torch.sigmoid(repeat_dist))
+       scaling = scaling.float()
+
+       rot = self.rotation_activation(scale_rot[:,3:7])
+       rot = rot.float()
+    
+      # post-process offsets to get centers for gaussians
+       offsets = offsets * scaling_repeat[:,:3]
+       xyz = repeat_anchor + offsets
+       xyzf = xyz
+       xyz = xyz.float()
+       
+
+        # cropping
+       if self.crop_box is not None and not self.training:
+            crop_ids = self.crop_box.within(self.means).squeeze()
+            if crop_ids.sum() == 0:
+                return self.get_empty_outputs(
+                    int(camera.width.item()), int(camera.height.item()), self.background_color
+                )
+       else:
+            crop_ids = None
+
+
+       BLOCK_WIDTH = 16  # this controls the tile size of rasterization, 16 is a good default
+       camera_scale_fac = self._get_downscale_factor()
+       camera.rescale_output_resolution(1 / camera_scale_fac)
+       viewmat = get_viewmat(optimized_camera_to_world)
+       K = camera.get_intrinsics_matrices().cuda()
+       W, H = int(camera.width.item()), int(camera.height.item())
+       self.last_size = (H, W)
+       camera.rescale_output_resolution(camera_scale_fac)  # type: ignore
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    # Render using the parameters obtained. Assume rasterization is modified to take these parameters.
+       render, alpha, info = rasterization(
+        means=xyz,
+        quats=rot,  # Assuming you've computed or collected these values
+        scales=scaling,
+        opacities=opacity,
+        colors=color,
+        viewmats=viewmat,
+        Ks=K,
+        width=W,
+        height=H,
+        tile_size=BLOCK_WIDTH,
+        packed=False,
+        near_plane=0.01,
+        far_plane=1e10,
+        render_mode=render_mode,  # Adjust according to requirement
+        sh_degree=None,  # Pass if needed
+        sparse_grad=False,
+        absgrad=True,
+        rasterize_mode=self.config.rasterize_mode,
+    )
+    
+       if self.training and info["means2d"].requires_grad:
+            info["means2d"].retain_grad()
+       self.xys = info["means2d"]  # [1, N, 2]
+       self.radii = info["radii"][0]  # [N]
+       self.opacity = neural_opacity
+       self.xyz = xyzf
+       alpha = alpha[:, ...]
+       
+       background = self._get_background_color()
+       rgb = render[:, ..., :3] + (1 - alpha) * background
+       rgb = torch.clamp(rgb, 0.0, 1.0)
+
+        # apply bilateral grid
+       if self.config.use_bilateral_grid and self.training:
+          if camera.metadata is not None and "cam_idx" in camera.metadata:
+              rgb = self._apply_bilateral_grid(rgb, camera.metadata["cam_idx"], H, W)
+
+       if render_mode == "RGB+ED":
+          depth_im = render[:, ..., 3:4]
+          depth_im = torch.where(alpha > 0, depth_im, depth_im.detach().max()).squeeze(0)
+       else:
+            depth_im = None
+
+       if background.shape[0] == 3 and not self.training:
+            background = background.expand(H, W, 3)
+
+
+
+       return {
+            "rgb": rgb.squeeze(0),  # type: ignore
+            "depth": depth_im,  # type: ignore
+            "accumulation": alpha.squeeze(0),  # type: ignore
+            "background": background,  # type: ignore
+        }  # type: ignore
+    
+
+    def get_training_callbacks(
+        self, training_callback_attributes: TrainingCallbackAttributes
+    ) -> List[TrainingCallback]:
+        cbs = []
+        cbs.append(TrainingCallback([TrainingCallbackLocation.BEFORE_TRAIN_ITERATION], self.step_cb))
+        # The order of these matters
+        cbs.append(
+            TrainingCallback(
+                [TrainingCallbackLocation.AFTER_TRAIN_ITERATION],
+                self.after_train,
+            )
+        )
+        cbs.append(
+            TrainingCallback(
+                [TrainingCallbackLocation.AFTER_TRAIN_ITERATION],
+                self.refinement_after,
+                update_every_num_iters=self.config.refine_every,
+                args=[training_callback_attributes.optimizers],
+            )
+        )
+
+        return cbs
